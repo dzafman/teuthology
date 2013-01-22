@@ -164,24 +164,37 @@ def _make_scratch_dir(ctx, role, subdir):
         retVal = True
 
     if not subdir: subdir = 'client.{id}'.format(id=id_)
-    remote.run(
-        args=[
-            # cd first so this will fail if the mount point does
-            # not exist; pure install -d will silently do the
-            # wrong thing
-            'cd',
-            '--',
-            mnt,
-            run.Raw('&&'),
-            'sudo',
-            'install',
-            '-d',
-            '-m', '0755',
-            '--owner={user}'.format(user=dir_owner),
-            '--',
-            subdir,
-            ],
-        )
+    if retVal:
+        remote.run(
+            args=[
+                'cd',
+                '--',
+                mnt,
+                run.Raw('&&'),
+                'mkdir',
+                '--',
+                subdir,
+                ],
+            )
+    else:
+        remote.run(
+            args=[
+                # cd first so this will fail if the mount point does
+                # not exist; pure install -d will silently do the
+                # wrong thing
+                'cd',
+                '--',
+                mnt,
+                run.Raw('&&'),
+                'sudo',
+                'install',
+                '-d',
+                '-m', '0755',
+                '--owner={user}'.format(user=dir_owner),
+                '--',
+                subdir,
+                ],
+            )
 
     return retVal
 
