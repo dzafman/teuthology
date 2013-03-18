@@ -1,8 +1,9 @@
+from cStringIO import StringIO
 import logging
 import ceph_manager
 from teuthology import misc as teuthology
 import time
-
+from ..orchestra import run
 
 log = logging.getLogger(__name__)
 
@@ -49,136 +50,108 @@ def task(ctx, config):
         )
     ctx.manager = manager
 
-    #while len(manager.get_osd_status()['up']) < 3:
-    #    time.sleep(10)
+    # Give 2 seconds for injectargs + osd_op_complaint_time (30) + 2 * osd_heartbeat_interval (6) + 6 padding
+    sleep_time = 50
 
-    proc = remote.run(args=['ceph', '-w'], stdout=PIPE, wait=False)
+    # XXX: Wait for osd.0 to be up?
+    while len(manager.get_osd_status()['up']) < 6:
+        time.sleep(10)
+
+    # State NONE -> NEAR
+    log.info('1. Verify warning messages when exceeding nearfull_ratio')
+
+    proc = mon.run(
+        args=[
+          'ceph', '-w', '-t', str(sleep_time),
+        ],
+        stdout=StringIO(),
+        wait=False,
+        )
 
     manager.raw_cluster_cmd('tell', 'osd.0', 'injectargs', '--osd_failsafe_nearfull_ratio .00001')
 
+    proc.exitstatus.get()
+
+    lines = proc.stdout.getvalue().split('\n')
+    print lines
+
+    count = len(filter(lambda line: '[WRN] OSD near full' in line, lines))
+    assert count == 2, 'Incorrect number of warning messages expected 2 got %d' % count
+
+    """
+    proc = mon.run(args=['ceph', '-w'], stdout=PIPE, wait=False)
+
     #Should see "[WRN] OSD near full" twice in ceph -w output in 50 seconds
     count = 0
+    error = 0
     while True:
         line = proc.stdout.readline()
         if line.contains("[WRN] OSD near full"):
             count++
+        if line.contains("OSD full"):
+            log.error('incorrect log message: %s', line)
+            error++
 
     if count != 2:
         log.error('Incorrect number of warning messages expected 2 got %d', count)
-
-    # Put back default
-    manager.raw_cluster_cmd('tell', 'osd.0', 'injectargs', '--osd_failsafe_nearfull_ratio .9')
+        error++
 
     # Terminate ceph -w
+
+    # State NEAR -> FULL
+    log.info('2. Verify error messages when exceeding full_ratio')
 
     proc = remote.run(args=['ceph', '-w'], stdout=PIPE, wait=False)
 
     manager.raw_cluster_cmd('tell', 'osd.0', 'injectargs', '--osd_failsafe_full_ratio .00001')
+    time.sleep(10)
+
+    # Check log message
+
+    log.info('3. Verify write failure when exceeding full_ratio')
+
+    # Write data
 
     # Put back default
     manager.raw_cluster_cmd('tell', 'osd.0', 'injectargs', '--osd_failsafe_full_ratio .97')
-
-
-
-    # something that is always there
-    dummyfile = '/etc/fstab'
-    dummyfile2 = '/etc/resolv.conf'
-
-    # create 1 pg pool
-    log.info('creating foo')
-    manager.raw_cluster_cmd('osd', 'pool', 'create', 'foo', '1')
-
-    osds = [0, 1, 2]
-    for i in osds:
-        manager.set_config(i, osd_min_pg_log_entries=1)
-
-    # determine primary
-    divergent = manager.get_pg_primary('foo', 0)
-    log.info("primary and soon to be divergent is %d", divergent)
-    non_divergent = [0,1,2]
-    non_divergent.remove(divergent)
-
-    log.info('writing initial objects')
-    # write 1000 objects
-    for i in range(1000):
-        rados(testdir, mon, ['-p', 'foo', 'put', 'existing_%d' % i, dummyfile])
-
-    manager.wait_for_clean()
-
-    # blackhole non_divergent
-    log.info("blackholing osds %s", str(non_divergent))
-    for i in non_divergent:
-        manager.set_config(i, filestore_blackhole='')
-
-    # write 1 (divergent) object
-    log.info('writing divergent object existing_0')
-    rados(
-        testdir, mon, ['-p', 'foo', 'put', 'existing_0', dummyfile2],
-        wait=False)
     time.sleep(10)
-    mon.run(
-        args=['killall', '-9', 'rados'],
-        wait=True,
-        check_status=False)
 
-    # kill all the osds
-    log.info('killing all the osds')
-    for i in osds:
-        manager.kill_osd(i)
-    for i in osds:
-        manager.mark_down_osd(i)
-    for i in osds:
-        manager.mark_out_osd(i)
+    # State FULL -> NEAR
+    log.info('4. Verify write success when NOT exceeding full_ratio')
 
-    # bring up non-divergent
-    log.info("bringing up non_divergent %s", str(non_divergent))
-    for i in non_divergent:
-        manager.revive_osd(i)
-    for i in non_divergent:
-        manager.mark_in_osd(i)
+    # Write should succeed
 
-    log.info('making log long to prevent backfill')
-    for i in non_divergent:
-        manager.set_config(i, osd_min_pg_log_entries=100000)
+    log.info('5. Verify warning messages again when exceeding nearfull_ratio')
 
-    # write 1 non-divergent object (ensure that old divergent one is divergent)
-    log.info('writing non-divergent object existing_1')
-    rados(testdir, mon, ['-p', 'foo', 'put', 'existing_1', dummyfile2])
+    # Check warning messages again
 
-    manager.wait_for_recovery()
+    # Put back nearfull default
+    manager.raw_cluster_cmd('tell', 'osd.0', 'injectargs', '--osd_failsafe_nearfull_ratio .9')
+    time.sleep(10)
 
-    # ensure no recovery
-    log.info('delay recovery')
-    for i in non_divergent:
-        manager.set_config(i, osd_recovery_delay_start=100000)
+    # State NEAR -> NONE
+    log.info('6. Verify no warning messages when nothing exceeded')
 
-    # bring in our divergent friend
-    log.info("revive divergent %d", divergent)
-    manager.revive_osd(divergent)
+    # Check nothing logged
 
-    while len(manager.get_osd_status()['up']) < 3:
-        time.sleep(10)
+    # State NONE -> FULL
+    log.info('7. Verify warning messages again when exceeding full_ratio')
 
-    log.info('delay recovery divergent')
-    manager.set_config(divergent, osd_recovery_delay_start=100000)
-    log.info('mark divergent in')
-    manager.mark_in_osd(divergent)
+    manager.raw_cluster_cmd('tell', 'osd.0', 'injectargs', '--osd_failsafe_full_ratio .00001')
+    time.sleep(10)
 
-    log.info('wait for peering')
-    rados(testdir, mon, ['-p', 'foo', 'put', 'foo', dummyfile])
+    # Check log
 
-    log.info("killing divergent %d", divergent)
-    manager.kill_osd(divergent)
-    log.info("reviving divergent %d", divergent)
-    manager.revive_osd(divergent)
+    # State FULL -> NONE
+    manager.raw_cluster_cmd('tell', 'osd.0', 'injectargs', '--osd_failsafe_full_ratio .97')
+    time.sleep(10)
 
-    log.info('allowing recovery')
-    for i in non_divergent:
-        manager.set_config(i, osd_recovery_delay_start=0)
+    # Check no log
 
-    log.info('reading existing_0')
-    exit_status = rados(testdir, mon,
-                        ['-p', 'foo', 'get', 'existing_0',
-                         '-o', '/tmp/existing'])
-    assert exit_status is 0
-    log.info("success")
+    if error == 0:
+        log.info('Test Passed')
+    else
+        log.error('Test failures: %d', error)
+
+   """
+
